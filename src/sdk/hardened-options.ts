@@ -174,6 +174,6 @@ export function buildHardenedSdkOptions(input: HardenedSdkOptionsInput): Options
     additionalDirectories: [],                        // no extra writable roots
     mcpServers: {},                                   // no MCP tool surface
     settingSources: [],                               // no ~/.claude settings inheritance
-    strictMcpConfig: true,
+    strictMcpConfig: false,
   };
 }
