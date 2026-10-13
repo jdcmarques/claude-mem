@@ -28,12 +28,17 @@ import {
 } from '../../../../src/shared/observer-health.js';
 import { resolveConfigDirProfileKey } from '../../../../src/shared/EnvManager.js';
 import { getProjectContext } from '../../../../src/utils/project-name.js';
+import { buildWorkStateContextSection } from '../../../../src/services/context/sections/WorkStateRenderer.js';
 
 // The route reads the ledger from paths.dataDir() (CLAUDE_MEM_DATA_DIR, set to a
 // per-run temp dir by tests/preload.ts), so write it there for the health case.
 const observerHealthPath = join(realPaths.paths.dataDir(), OBSERVER_HEALTH_FILENAME);
 
 let loggerSpies: ReturnType<typeof spyOn>[] = [];
+
+// What every response leads with while nothing has been written: the rule, then "Nothing open yet."
+const EMPTY_WORK_STATE_SECTION = buildWorkStateContextSection([], 0);
+const workStateEntriesStub = mock((): any[] => []);
 
 interface MockRes {
   setHeader: ReturnType<typeof mock>;
@@ -88,18 +93,21 @@ describe('SearchRoutes Welcome Hint', () => {
 
     countQueryStub = mock(() => ({ count: 0 }));
     prepareStub = mock(() => ({ get: countQueryStub }));
-    mockSessionStore = { db: { prepare: prepareStub } };
+    mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
     mockSearchManager = {
       getSessionStore: () => mockSessionStore,
     };
 
     generateContextStub.mockClear();
+    workStateEntriesStub.mockClear();
+    workStateEntriesStub.mockImplementation(() => []);
     delete process.env.CLAUDE_MEM_WELCOME_HINT_ENABLED;
   });
 
   afterEach(() => {
     loggerSpies.forEach(spy => spy.mockRestore());
     delete process.env.CLAUDE_MEM_WELCOME_HINT_ENABLED;
+    delete process.env.CLAUDE_MEM_WORK_STATE_ENABLED;
     delete process.env.CLAUDE_MEM_WORKER_PORT;
     if (existsSync(observerHealthPath)) rmSync(observerHealthPath, { force: true });
   });
@@ -210,7 +218,7 @@ describe('SearchRoutes Welcome Hint', () => {
   it('skips the welcome hint when at least one observation exists', async () => {
     countQueryStub = mock(() => ({ count: 7 }));
     prepareStub = mock(() => ({ get: countQueryStub }));
-    mockSessionStore = { db: { prepare: prepareStub } };
+    mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
     mockSearchManager = { getSessionStore: () => mockSessionStore };
 
     const routes = new SearchRoutes(mockSearchManager);
@@ -223,7 +231,7 @@ describe('SearchRoutes Welcome Hint', () => {
     await new Promise(resolve => setImmediate(resolve));
 
     expect(generateContextStub).toHaveBeenCalledTimes(1);
-    expect(res.send).toHaveBeenCalledWith('CONTEXT_FROM_GENERATOR');
+    expect(res.send).toHaveBeenCalledWith(`${EMPTY_WORK_STATE_SECTION}\n\nCONTEXT_FROM_GENERATOR`);
   });
 
   it('skips the welcome hint when CLAUDE_MEM_WELCOME_HINT_ENABLED=false', async () => {
@@ -239,7 +247,7 @@ describe('SearchRoutes Welcome Hint', () => {
     await new Promise(resolve => setImmediate(resolve));
 
     expect(generateContextStub).toHaveBeenCalledTimes(1);
-    expect(res.send).toHaveBeenCalledWith('CONTEXT_FROM_GENERATOR');
+    expect(res.send).toHaveBeenCalledWith(`${EMPTY_WORK_STATE_SECTION}\n\nCONTEXT_FROM_GENERATOR`);
   });
 
   it('queries both projects in a worktree (multi-project) request', async () => {
@@ -266,7 +274,7 @@ describe('SearchRoutes Welcome Hint', () => {
   it('threads normalized platformSource into observation count and context generation', async () => {
     countQueryStub = mock(() => ({ count: 2 }));
     prepareStub = mock(() => ({ get: countQueryStub }));
-    mockSessionStore = { db: { prepare: prepareStub } };
+    mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
     mockSearchManager = { getSessionStore: () => mockSessionStore };
 
     const routes = new SearchRoutes(mockSearchManager);
@@ -302,7 +310,7 @@ describe('SearchRoutes Welcome Hint', () => {
   it('does not leak positive observation state across route instances', async () => {
     countQueryStub = mock(() => ({ count: 3 }));
     prepareStub = mock(() => ({ get: countQueryStub }));
-    mockSessionStore = { db: { prepare: prepareStub } };
+    mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
     mockSearchManager = { getSessionStore: () => mockSessionStore };
 
     const activeRoutes = new SearchRoutes(mockSearchManager);
@@ -317,7 +325,7 @@ describe('SearchRoutes Welcome Hint', () => {
     generateContextStub.mockClear();
     countQueryStub = mock(() => ({ count: 0 }));
     prepareStub = mock(() => ({ get: countQueryStub }));
-    mockSessionStore = { db: { prepare: prepareStub } };
+    mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
     mockSearchManager = { getSessionStore: () => mockSessionStore };
 
     const emptyRoutes = new SearchRoutes(mockSearchManager);
@@ -349,6 +357,105 @@ describe('SearchRoutes Welcome Hint', () => {
     expect(body).toContain('http://localhost:43210');
   });
 
+  describe('work state', () => {
+    const releaseEntries = () => [
+      { id: 1, project: '/path/parent', list_name: 'release', fields: { version: '13.25.3', status: 'active' }, created_at_epoch: Date.now() },
+      { id: 2, project: '/path/worktree', list_name: 'release', fields: { task: 'publish', status: 'todo' }, created_at_epoch: Date.now() },
+    ];
+
+    it('leads the context with what is still open and takes its length off the memory budget', async () => {
+      countQueryStub = mock(() => ({ count: 7 }));
+      prepareStub = mock(() => ({ get: countQueryStub }));
+      mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
+      // Both request keys are checkout aliases. Match the scope annotation
+      // supplied by SessionStore.getWorkStateEntries for those explicit keys.
+      workStateEntriesStub.mockImplementation(() => releaseEntries().map(entry => ({
+        ...entry, scope_project: '/path/worktree',
+      })));
+      const handler = captureContextInjectHandler(new SearchRoutes({ getSessionStore: () => mockSessionStore } as any));
+      const res = createMockRes();
+
+      handler({ query: { projects: '/path/parent,/path/worktree' } } as unknown as Request, res as unknown as Response);
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(workStateEntriesStub).toHaveBeenCalledWith(['/path/parent', '/path/worktree']);
+      const body = (res.send as any).mock.calls[0][0] as string;
+      expect(body).toStartWith('# Work state: your to-do lists and working state');
+      expect(body).toContain('\n\nStill open:\n- release: version=13.25.3, status=active, updated 1 minute ago\n  - [todo] publish, updated 1 minute ago');
+      expect(body).toEndWith('\n\nCONTEXT_FROM_GENERATOR');
+      // The budget is reserved for the section as rendered with its time
+      // placeholders (cacheable form), which are never shorter than the filled text.
+      const renderedEntries = (workStateEntriesStub.mock.results[0] as { value: any[] }).value;
+      const placeholderSectionLength = buildWorkStateContextSection(renderedEntries, 'placeholders').length;
+      const filledSectionLength = body.length - '\n\nCONTEXT_FROM_GENERATOR'.length;
+      expect(placeholderSectionLength).toBeGreaterThanOrEqual(filledSectionLength);
+      expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: placeholderSectionLength + 2 }), false);
+    });
+
+    it('leads the welcome hint with what is still open', async () => {
+      workStateEntriesStub.mockImplementation(releaseEntries);
+      const handler = captureContextInjectHandler(new SearchRoutes(mockSearchManager));
+      const res = createMockRes();
+
+      handler({ query: { projects: '/path/to/empty-project' } } as unknown as Request, res as unknown as Response);
+      await new Promise(resolve => setImmediate(resolve));
+
+      const body = (res.send as any).mock.calls[0][0] as string;
+      expect(body).toStartWith('# Work state: your to-do lists and working state');
+      expect(body).toContain('  - [todo] publish');
+      expect(body.indexOf('Still open:')).toBeLessThan(body.indexOf('# claude-mem status'));
+    });
+
+    // #4606: a host that tracks work its own way can turn the section off, so
+    // the agent is not told to use a to-do tool instead of the host's.
+    it('leaves the work state out when CLAUDE_MEM_WORK_STATE_ENABLED=false', async () => {
+      process.env.CLAUDE_MEM_WORK_STATE_ENABLED = 'false';
+      countQueryStub = mock(() => ({ count: 7 }));
+      prepareStub = mock(() => ({ get: countQueryStub }));
+      mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
+      workStateEntriesStub.mockImplementation(releaseEntries);
+      const handler = captureContextInjectHandler(new SearchRoutes({ getSessionStore: () => mockSessionStore } as any));
+      const res = createMockRes();
+
+      handler({ query: { projects: '/path/to/active-project' } } as unknown as Request, res as unknown as Response);
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(workStateEntriesStub).not.toHaveBeenCalled();
+      expect(res.send).toHaveBeenCalledWith('CONTEXT_FROM_GENERATOR');
+      expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: 0 }), false);
+    });
+
+    it('leaves the work state out of the welcome hint when CLAUDE_MEM_WORK_STATE_ENABLED=false', async () => {
+      process.env.CLAUDE_MEM_WORK_STATE_ENABLED = 'false';
+      workStateEntriesStub.mockImplementation(releaseEntries);
+      const handler = captureContextInjectHandler(new SearchRoutes(mockSearchManager));
+      const res = createMockRes();
+
+      handler({ query: { projects: '/path/to/empty-project' } } as unknown as Request, res as unknown as Response);
+      await new Promise(resolve => setImmediate(resolve));
+
+      const body = (res.send as any).mock.calls[0][0] as string;
+      expect(body).toStartWith('# claude-mem status');
+      expect(body).not.toContain('work_state_write');
+    });
+
+    it('leaves the work state out of the colored terminal preview, which is for the human', async () => {
+      countQueryStub = mock(() => ({ count: 7 }));
+      prepareStub = mock(() => ({ get: countQueryStub }));
+      mockSessionStore = { db: { prepare: prepareStub }, getWorkStateEntries: workStateEntriesStub };
+      workStateEntriesStub.mockImplementation(releaseEntries);
+      const handler = captureContextInjectHandler(new SearchRoutes({ getSessionStore: () => mockSessionStore } as any));
+      const res = createMockRes();
+
+      handler({ query: { projects: '/path/to/active-project', colors: 'true' } } as unknown as Request, res as unknown as Response);
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(workStateEntriesStub).not.toHaveBeenCalled();
+      expect(res.send).toHaveBeenCalledWith('CONTEXT_FROM_GENERATOR');
+      expect(generateContextStub).toHaveBeenCalledWith(expect.objectContaining({ reserveChars: 0 }), true);
+    });
+  });
+
   // A host that cannot run the project resolver itself (the in-process OMP
   // hook, #3556) sends its cwd; the route reads the keys the CLI context hook
   // would send for that checkout.
@@ -356,7 +463,10 @@ describe('SearchRoutes Welcome Hint', () => {
     let checkout: string;
 
     const searchManagerWithObservations = () => ({
-      getSessionStore: () => ({ db: { prepare: mock(() => ({ get: mock(() => ({ count: 1 })) })) } }),
+      getSessionStore: () => ({
+        db: { prepare: mock(() => ({ get: mock(() => ({ count: 1 })) })) },
+        getWorkStateEntries: workStateEntriesStub,
+      }),
     });
 
     beforeEach(() => {
@@ -387,6 +497,18 @@ describe('SearchRoutes Welcome Hint', () => {
       const res = createMockRes();
 
       handler({ query: { cwd: checkout } } as unknown as Request, res as unknown as Response);
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(res.send).toHaveBeenCalledWith('');
+      expect(generateContextStub).not.toHaveBeenCalled();
+    });
+
+    it('injects nothing for an excluded checkout even when the host names another project', async () => {
+      process.env.CLAUDE_MEM_EXCLUDED_PROJECTS = basename(checkout);
+      const handler = captureContextInjectHandler(new SearchRoutes(searchManagerWithObservations() as any));
+      const res = createMockRes();
+
+      handler({ query: { cwd: checkout, projects: 'project-override' } } as unknown as Request, res as unknown as Response);
       await new Promise(resolve => setImmediate(resolve));
 
       expect(res.send).toHaveBeenCalledWith('');
